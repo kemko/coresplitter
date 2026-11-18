@@ -228,6 +228,7 @@ pub struct CoreConfig {
     pub event_log_level: LogLevel,
     pub event_log_json: bool,
     pub record_radio_rx: bool,
+    pub drain_offline: bool,
     pub retention: Retention,
     pub new_client_backlog: Backlog,
 }
@@ -387,7 +388,14 @@ impl Core {
         let mut maintenance_tick = tokio::time::interval(MAINTENANCE_INTERVAL);
         maintenance_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        let mut offline_poll = time::interval(Duration::from_secs(10));
+        offline_poll.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
         loop {
+            if *self.shutdown_rx.borrow() {
+                break;
+            }
+            // APP_START must snapshot the database after any outstanding offline pop.
+            let offline_pop = self.offline_pop_in_flight();
             tokio::select! {
                 biased;
 
@@ -397,7 +405,7 @@ impl Core {
                         break;
                     }
                 }
-                Some(cmd) = self.command_rx.recv() => {
+                Some(cmd) = self.command_rx.recv(), if !offline_pop => {
                     self.handle_client_command(cmd).await;
                 }
                 data = self.radio_recv_rx.recv() => {
@@ -411,6 +419,9 @@ impl Core {
                 }
                 _ = timeout_tick.tick() => {
                     self.check_in_flight_timeout().await;
+                }
+                _ = offline_poll.tick(), if self.config.drain_offline => {
+                    self.poll_if_offline().await;
                 }
                 _ = maintenance_tick.tick() => {
                     self.run_maintenance().await;
@@ -635,7 +646,7 @@ impl Core {
                 data = self.radio_recv_rx.recv() => {
                     match data {
                         Some(payload) if !payload.is_empty() && payload[0] == 0x05 => {
-                            self.cache_response(0x05, &payload).await;
+                            self.cache_response(0x05, &payload).await?;
                             if self.self_info_raw.is_some() {
                                 tracing::info!(
                                     name = self.radio_name.as_deref().unwrap_or("?"),
@@ -682,7 +693,7 @@ impl Core {
                 data = self.radio_recv_rx.recv() => {
                     match data {
                         Some(payload) if !payload.is_empty() && payload[0] == 0x0D => {
-                            self.cache_response(0x0D, &payload).await;
+                            self.cache_response(0x0D, &payload).await?;
                             return Ok(());
                         }
                         Some(payload) if !payload.is_empty() && payload[0] == 0x01 => {
@@ -1382,6 +1393,21 @@ impl Core {
         self.send_to_client(client_id, payload);
     }
 
+    fn offline_pop_in_flight(&self) -> bool {
+        self.in_flight
+            .as_ref()
+            .is_some_and(|f| f.client_id.is_none() && f.cmd_code() == 0x0A)
+    }
+
+    async fn poll_if_offline(&mut self) {
+        if self.config.drain_offline
+            && self.in_flight.is_none()
+            && self.client_channels.lock().unwrap().is_empty()
+        {
+            self.dispatch_to_radio(None, vec![0x0A]).await;
+        }
+    }
+
     async fn handle_radio_rx(&mut self, payload: Vec<u8>) {
         if payload.is_empty() {
             return;
@@ -1390,7 +1416,19 @@ impl Core {
         let resp_code = payload[0];
         self.log_event("<-", resp_code, &payload);
 
-        self.cache_response(resp_code, &payload).await;
+        let offline_message =
+            self.offline_pop_in_flight() && matches!(resp_code, 0x07 | 0x08 | 0x10 | 0x11 | 0x1B);
+        while let Err(e) = self.cache_response(resp_code, &payload).await {
+            tracing::error!(error = %e, "failed to persist radio message");
+            if !offline_message {
+                break;
+            }
+            // The radio has already removed this frame. Keep it until SQLite accepts it.
+            tokio::select! {
+                _ = time::sleep(Duration::from_secs(1)) => {}
+                _ = self.shutdown_rx.changed() => return,
+            }
+        }
 
         if self.config.record_radio_rx {
             let _ = self.state.insert_raw_rx(resp_code, &payload).await;
@@ -1399,6 +1437,9 @@ impl Core {
         // 1. If the frame completes (or belongs to) the in_flight request,
         //    route it to that client.
         if self.try_route_to_in_flight(resp_code, &payload).await {
+            if offline_message {
+                self.poll_if_offline().await;
+            }
             return;
         }
         // 2. If it's a late ACK matching a previous MSG_SENT, route it.
@@ -1417,6 +1458,9 @@ impl Core {
                 }
             }
             let _ = self.broadcast_tx.send(payload);
+            if resp_code == 0x83 {
+                self.poll_if_offline().await;
+            }
             return;
         }
         // 4. A reply nobody is waiting for: typically the late answer to a
@@ -1468,7 +1512,7 @@ impl Core {
         // a global event from the rest of the network's point of view:
         // every connected client should see it. Fan out to the other
         // clients (the originator just got it through send_to_client).
-        if cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
+        if client_id.is_some() && cmd_code == 0x0A && matches!(code, 0x07 | 0x08 | 0x10 | 0x11) {
             self.broadcast_to_others(client_id.as_ref(), payload);
         }
 
@@ -1498,7 +1542,7 @@ impl Core {
         true
     }
 
-    async fn cache_response(&mut self, code: u8, payload: &[u8]) {
+    async fn cache_response(&mut self, code: u8, payload: &[u8]) -> Result<()> {
         match code {
             0x03 if payload.len() >= CONTACT_FRAME_LEN => {
                 let pk = payload[1..33].to_vec();
@@ -1570,20 +1614,16 @@ impl Core {
                         })
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                    if let Err(e) = self
-                        .store_message(NewMessage {
-                            msg_type: "contact",
-                            from_key: from_key.as_deref(),
-                            channel_idx: None,
-                            text: &text,
-                            timestamp: ts,
-                            frame: payload,
-                            origin: None,
-                        })
-                        .await
-                    {
-                        tracing::warn!(error = %e, "failed to cache message");
-                    }
+                    self.store_message(NewMessage {
+                        msg_type: "contact",
+                        from_key: from_key.as_deref(),
+                        channel_idx: None,
+                        text: &text,
+                        timestamp: ts,
+                        frame: payload,
+                        origin: None,
+                    })
+                    .await?;
                 }
             }
             0x08 => {
@@ -1607,20 +1647,16 @@ impl Core {
                         })
                         .unwrap_or_else(|| chrono::Utc::now().timestamp());
 
-                    if let Err(e) = self
-                        .store_message(NewMessage {
-                            msg_type: "channel",
-                            from_key: None,
-                            channel_idx,
-                            text: &text,
-                            timestamp: ts,
-                            frame: payload,
-                            origin: None,
-                        })
-                        .await
-                    {
-                        tracing::warn!(error = %e, "failed to cache channel message");
-                    }
+                    self.store_message(NewMessage {
+                        msg_type: "channel",
+                        from_key: None,
+                        channel_idx,
+                        text: &text,
+                        timestamp: ts,
+                        frame: payload,
+                        origin: None,
+                    })
+                    .await?;
                 }
             }
             0x10 if payload.len() >= 16 => {
@@ -1633,20 +1669,16 @@ impl Core {
                 } else {
                     String::new()
                 };
-                if let Err(e) = self
-                    .store_message(NewMessage {
-                        msg_type: "contact",
-                        from_key: from_key.as_deref(),
-                        channel_idx: None,
-                        text: &text,
-                        timestamp: ts,
-                        frame: payload,
-                        origin: None,
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, "failed to cache V3 contact message");
-                }
+                self.store_message(NewMessage {
+                    msg_type: "contact",
+                    from_key: from_key.as_deref(),
+                    channel_idx: None,
+                    text: &text,
+                    timestamp: ts,
+                    frame: payload,
+                    origin: None,
+                })
+                .await?;
             }
             0x11 if payload.len() >= 11 => {
                 let channel_idx = payload[4] as i64;
@@ -1656,20 +1688,28 @@ impl Core {
                 } else {
                     String::new()
                 };
-                if let Err(e) = self
-                    .store_message(NewMessage {
-                        msg_type: "channel",
-                        from_key: None,
-                        channel_idx: Some(channel_idx),
-                        text: &text,
-                        timestamp: ts,
-                        frame: payload,
-                        origin: None,
-                    })
-                    .await
-                {
-                    tracing::warn!(error = %e, "failed to cache V3 channel message");
-                }
+                self.store_message(NewMessage {
+                    msg_type: "channel",
+                    from_key: None,
+                    channel_idx: Some(channel_idx),
+                    text: &text,
+                    timestamp: ts,
+                    frame: payload,
+                    origin: None,
+                })
+                .await?;
+            }
+            0x1B if self.offline_pop_in_flight() && payload.len() >= 9 => {
+                self.store_message(NewMessage {
+                    msg_type: "channel_data",
+                    from_key: None,
+                    channel_idx: Some(payload[4].into()),
+                    text: "",
+                    timestamp: chrono::Utc::now().timestamp(),
+                    frame: payload,
+                    origin: None,
+                })
+                .await?;
             }
             0x12 if payload.len() >= 50 => {
                 let idx = payload[1] as i64;
@@ -1690,6 +1730,7 @@ impl Core {
             }
             _ => {}
         }
+        Ok(())
     }
 
     fn log_event(&self, arrow: &str, code: u8, payload: &[u8]) {

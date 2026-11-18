@@ -77,6 +77,10 @@ pub struct Cli {
     #[arg(long, env = "CORESPLITTER_RECORD_RADIO_RX")]
     pub record_radio_rx: bool,
 
+    /// Fetch and store incoming messages while no TCP clients are connected
+    #[arg(long, env = "CORESPLITTER_DRAIN_OFFLINE")]
+    pub drain_offline: bool,
+
     /// Days to keep stored messages (0 = forever)
     #[arg(
         long,
@@ -145,6 +149,7 @@ impl Cli {
             event_log_level,
             event_log_json: self.json,
             record_radio_rx: self.record_radio_rx,
+            drain_offline: self.drain_offline,
             retention: Retention {
                 messages_days: self.messages_retention_days,
                 raw_rx_days: self.raw_rx_retention_days,

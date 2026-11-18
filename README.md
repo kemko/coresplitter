@@ -90,6 +90,18 @@ which does the same for Meshtastic.
    with `--tcp-frontend-port 5000,5001`. What a never-seen client gets
    is set with `CORESPLITTER_NEW_CLIENT_BACKLOG`.
 
+### Collect messages while the phone is away
+
+Enable `--drain-offline` or `CORESPLITTER_DRAIN_OFFLINE=true` and keep the
+data directory on persistent storage. Connect the phone once to register it.
+While no TCP clients are connected, the proxy fetches the companion inbox
+on a messages-waiting notification and polls every 10 seconds as a fallback.
+It stores each frame before requesting the next. Reconnect the same app on
+the same port to fetch its backlog from SQLite, including after a proxy restart.
+For messages collected before the first connection, set
+`CORESPLITTER_NEW_CLIENT_BACKLOG` (for example, `7d`).
+The radio must have the channels you want to receive configured.
+
 ## Requirements
 
 - **Rust edition 2024** (requires Rust ≥ 1.85)
@@ -175,6 +187,7 @@ cargo run --release --features ble -- \
 | `CORESPLITTER_DATA_DIR` | Data directory (default: ./data) |
 | `CORESPLITTER_LOG_LEVEL` | Log level: off, error, warn, info, debug, verbose |
 | `CORESPLITTER_LOG_JSON` | Enable JSON event logging |
+| `CORESPLITTER_DRAIN_OFFLINE` | Fetch the companion inbox while all TCP clients are disconnected (default: false) |
 | `CORESPLITTER_RECORD_RADIO_RX` | Record all raw radio RX to database |
 | `CORESPLITTER_MESSAGES_RETENTION_DAYS` | Days to keep stored messages, 0 = forever (default: 0) |
 | `CORESPLITTER_RAW_RX_RETENTION_DAYS` | Days to keep raw_rx recordings, 0 = forever (default: 7) |
